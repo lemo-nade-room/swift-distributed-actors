@@ -45,6 +45,17 @@ let system = await ClusterSystem("ReceptionistExamples")
 let worker = Worker(actorSystem: system)
 ```
 
+If you want to run everything on a single process without opening any
+network ports, disable clustering when you construct the system. This is
+useful for local testing where you still want to exercise the receptionist
+APIs but do not need to join other nodes:
+
+```swift
+let system = await ClusterSystem("ReceptionistExamples") { settings in
+    settings.enabled = false   // run locally without binding a port
+}
+```
+
 ```swift
 await system.receptionist.checkIn(worker, with: .workers) 
 ```
@@ -100,6 +111,57 @@ distributed actor Boss: LifecycleWatch {
     }
 }
 ```
+
+#### Load balancing across multiple registrations
+
+It is common to register many actors under the same key (for example, a pool of `Worker`s), and then pick whichever
+actor is currently available when you want to issue work. There are two receptionist APIs that are useful for this:
+
+- ``DistributedReceptionist/lookup(_:)`` returns a snapshot `Set` of the actors that are registered right now. You can perform
+  an ad-hoc lookup and pick one of them immediately:
+
+    ```swift
+    let workers = await system.receptionist.lookup(.workers)
+    guard let worker = workers.randomElement() else {
+        logger.warning("No workers available")
+        return
+    }
+
+    try await worker.work()
+    ```
+
+- ``DistributedReceptionist/listing(of:file:line:)`` streams updates as actors check in or terminate. You can keep track of
+  available workers locally and always pick one when you need it:
+
+    ```swift
+    actor WorkerPool {
+        let system: ClusterSystem
+        private var workers: [Worker.ID: Worker] = [:]
+        private var listingTask: Task<Void, Never>?
+
+        init(system: ClusterSystem) {
+            self.system = system
+
+            listingTask = Task {
+                for await worker in await system.receptionist.listing(of: .workers) {
+                    workers[worker.id] = worker
+                }
+            }
+        }
+
+        func leaseWorker() -> Worker? {
+            workers.values.randomElement()
+        }
+
+        deinit {
+            listingTask?.cancel()
+        }
+    }
+    ```
+
+The receptionist automatically removes terminated workers from subsequent `lookup` results and listings, ensuring the pool only
+hands out live references. You are free to apply any policy for choosing a worker—random, round-robin, or based on custom
+load metrics maintained by your actors.
 
 #### Checking-out from receptionist listings
 
